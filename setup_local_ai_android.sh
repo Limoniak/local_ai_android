@@ -526,12 +526,13 @@ esac
 print_banner
 echo ""
 
-check_termux
-
-# SSH en premier : si la suite échoue, tu peux debug à distance
+# SSH en tout premier : si la suite échoue, tu peux debug à distance
 echo ""
 read -p "Activer l'accès SSH pour gérer le téléphone depuis ton PC ? [o/N] " SSH_CONFIRM
 if [[ "$SSH_CONFIRM" =~ ^[oOyY]$ ]]; then
+  if [ ! -d "/data/data/com.termux" ]; then
+    error "SSH impossible : ce script doit être exécuté dans Termux"
+  fi
   pkg update -y
   setup_ssh
   WIFI_IP=$(ip route get 1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')
@@ -542,6 +543,7 @@ if [[ "$SSH_CONFIRM" =~ ^[oOyY]$ ]]; then
   echo ""
 fi
 
+check_termux
 detect_vulkan
 install_packages
 build_llamacpp

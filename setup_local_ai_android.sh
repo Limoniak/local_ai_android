@@ -60,6 +60,7 @@ usage() {
   echo "  (aucune option)    Installation complète puis démarrage optionnel"
   echo "  --start            Démarre le serveur sans réinstaller"
   echo "  --stop             Arrête le serveur en cours"
+  echo "  --ssh              Active l'accès SSH (port 8022, auth par mot de passe)"
   echo "  --model <url>      Utilise un autre modèle GGUF (ex: depuis HuggingFace)"
   echo "  --help             Affiche cette aide"
   echo ""
@@ -137,6 +138,27 @@ detect_vulkan() {
     NGL=0
     warn "Vulkan non détecté — inférence CPU uniquement (-ngl 0)"
   fi
+}
+
+# ============================================================
+# Configuration SSH (accès distant depuis PC)
+# ============================================================
+setup_ssh() {
+  step "Configuration de l'accès SSH"
+
+  log "Installation d'openssh..."
+  pkg install -y openssh
+
+  echo ""
+  echo -e "${BOLD}Définis le mot de passe pour te connecter depuis ton PC :${RESET}"
+  passwd
+
+  # Démarrer sshd (le relancer s'il tourne déjà)
+  pkill -x sshd 2>/dev/null || true
+  sshd
+
+  SSH_USER=$(whoami)
+  success "SSH activé — utilisateur : ${SSH_USER} — port : 8022"
 }
 
 # ============================================================
@@ -275,6 +297,12 @@ for i in \$(seq 1 60); do
   sleep 2
 done
 
+# Démarrer sshd si installé (accès distant depuis PC)
+if command -v sshd &>/dev/null && ! pgrep -x sshd > /dev/null; then
+  sshd
+  echo "[BOOT] sshd démarré (port 8022)" >> "\$LOG"
+fi
+
 if pgrep -x llama-server > /dev/null; then
   echo "[BOOT] llama-server déjà en cours" >> "\$LOG"
   exit 0
@@ -379,6 +407,14 @@ launch_server() {
     echo -e "  ${YELLOW}⚠  API accessible à tous sur le réseau local sans authentification !${RESET}"
   fi
   echo ""
+  if command -v sshd &>/dev/null; then
+    if ! pgrep -x sshd > /dev/null; then
+      sshd
+    fi
+    echo -e "  ${BOLD}Accès SSH depuis PC :${RESET}"
+    echo -e "  ${CYAN}ssh -p 8022 $(whoami)@${WIFI_IP}${RESET}"
+    echo ""
+  fi
   echo "  Logs : tail -f ${LOG_FILE}"
   echo ""
 
@@ -426,6 +462,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --start)        MODE="start"; shift ;;
     --stop)         MODE="stop";  shift ;;
+    --ssh)          MODE="ssh";   shift ;;
     --help|-h)      MODE="help";  shift ;;
     --model)
       [ -z "$2" ] && error "--model nécessite une URL en argument"
@@ -455,6 +492,16 @@ case "$MODE" in
     launch_server
     exit 0
     ;;
+  ssh)
+    check_termux
+    setup_ssh
+    # Régénérer le boot script pour y inclure sshd si Termux:Boot est là
+    if [ -d "/data/data/com.termux.boot" ]; then
+      BOOT_AVAILABLE=true
+      setup_autostart
+    fi
+    exit 0
+    ;;
 esac
 
 # --- Installation complète ---
@@ -467,6 +514,13 @@ install_packages
 build_llamacpp
 download_model
 setup_api_key
+
+echo ""
+read -p "Activer l'accès SSH pour gérer le téléphone depuis ton PC ? [o/N] " SSH_CONFIRM
+if [[ "$SSH_CONFIRM" =~ ^[oOyY]$ ]]; then
+  setup_ssh
+fi
+
 setup_autostart
 battery_reminder
 

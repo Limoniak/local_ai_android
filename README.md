@@ -74,6 +74,40 @@ PORT=9090 THREADS=6 CONTEXT=8192 bash setup.sh --start
 
 ---
 
+## 💻 Gérer le téléphone depuis ton PC (SSH)
+
+Pendant l'installation, le script te propose d'activer **SSH** pour administrer le téléphone à distance. Tu peux aussi l'activer après coup :
+
+```bash
+bash setup.sh --ssh
+```
+
+Le script :
+1. Installe `openssh` dans Termux
+2. Te demande de définir un mot de passe
+3. Lance `sshd` (port **8022**) et l'ajoute au démarrage automatique
+
+### Se connecter depuis ton PC
+
+```bash
+ssh -p 8022 <user>@<ip-du-téléphone>
+```
+
+Le nom d'utilisateur (`whoami` dans Termux, style `u0_a123`) et la commande exacte sont affichés au démarrage du serveur.
+
+### Exemples d'usage distant
+
+```bash
+# Démarrer / arrêter le serveur IA sans toucher au téléphone
+ssh -p 8022 user@phone "bash ~/setup.sh --start"
+ssh -p 8022 user@phone "bash ~/setup.sh --stop"
+
+# Suivre les logs en direct
+ssh -p 8022 user@phone "tail -f ~/gemma4-server.log"
+```
+
+---
+
 ## 🌐 Appeler l'API depuis un autre appareil
 
 ```bash

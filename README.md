@@ -1,73 +1,93 @@
-# Local AI on Android
+# 📱 Local AI on Android
 
-Run a local LLM (Gemma 4) on your Android phone via Termux and expose an OpenAI-compatible API accessible from any device on your local network.
+> Transforme ton téléphone Android en serveur IA local accessible depuis tout ton réseau Wi-Fi.
 
-## Requirements
+Un seul script installe **llama.cpp** + **Gemma 4**, compile tout dans Termux et expose une API compatible OpenAI sur ton réseau local.
 
-- Android phone with [Termux](https://f-droid.org/packages/com.termux/) (from F-Droid)
-- [Termux:Boot](https://f-droid.org/packages/com.termux.boot/) (optional, for autostart on reboot)
-- Wi-Fi connection
-- ~3 GB free storage
+---
 
-## Installation
+## ✅ Prérequis
 
-Copy the script to your phone (via USB, Syncthing, etc.) then run in Termux:
+| Requis | Optionnel |
+|--------|-----------|
+| [Termux](https://f-droid.org/packages/com.termux/) (via F-Droid) | [Termux:Boot](https://f-droid.org/packages/com.termux.boot/) — démarrage auto au reboot |
+| Connexion Wi-Fi | |
+| ~3 Go de stockage libre | |
+
+> ⚠️ Installe Termux depuis **F-Droid**, pas depuis le Play Store (version non maintenue).
+
+---
+
+## 🚀 Installation
+
+Lance cette commande dans Termux pour télécharger et exécuter le script :
 
 ```bash
-bash setup_local_ai_android.sh
+wget -O setup.sh https://raw.githubusercontent.com/Limoniak/local_ai_android/main/setup_local_ai_android.sh && bash setup.sh
 ```
 
-The script will automatically:
-1. Install dependencies (`git`, `cmake`, `clang`, `wget`, `make`)
-2. Compile [llama.cpp](https://github.com/ggerganov/llama.cpp)
-3. Download the Gemma 4 E2B model (~1.3 GB, quantized Q4_K_M)
-4. Configure autostart on boot (if Termux:Boot is installed)
+Le script s'occupe de tout automatiquement :
 
-## Usage
+1. 📦 Installation des dépendances (`git`, `cmake`, `clang`, `wget`, `make`)
+2. 🔨 Compilation de [llama.cpp](https://github.com/ggerganov/llama.cpp) *(10-20 min)*
+3. 📥 Téléchargement du modèle Gemma 4 E2B Q4_K_M *(~1.3 Go)*
+4. 🔁 Configuration du démarrage automatique *(si Termux:Boot est installé)*
 
-### Start the server
+---
+
+## 🖥️ Utilisation
+
+### Démarrer le serveur
 
 ```bash
 bash setup_local_ai_android.sh --start
 ```
 
-The server starts on port `8080` and displays your phone's local IP.
+Le terminal affiche l'IP de ton téléphone et l'URL de l'API.
 
-### Query the API from another device
+### Appeler l'API depuis un autre appareil
 
 ```bash
-# List available models
-curl http://<phone-ip>:8080/v1/models
+# Lister les modèles disponibles
+curl http://<ip-du-téléphone>:8080/v1/models
 
-# Chat completion
-curl http://<phone-ip>:8080/v1/chat/completions \
+# Chat
+curl http://<ip-du-téléphone>:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma-4-e2b-it-Q4_K_M",
-    "messages": [{"role": "user", "content": "Hello!"}]
+    "messages": [{"role": "user", "content": "Bonjour !"}]
   }'
 ```
 
-### Compatible clients
+### Clients compatibles
 
-Any OpenAI-compatible client works — just set the base URL to `http://<phone-ip>:8080/v1`:
+L'API est compatible OpenAI — configure juste l'URL de base sur `http://<ip>:8080/v1` :
 
 - [Open WebUI](https://github.com/open-webui/open-webui)
-- [Cursor](https://cursor.sh) / VS Code with Continue
+- [Continue](https://continue.dev) (VS Code / JetBrains)
 - Python `openai` SDK
 
-## Manual battery optimization
+---
 
-To prevent Android from killing the server in the background:
+## 🔋 Optimisation batterie (important)
 
-**Settings → Battery → App optimization → Disable for Termux and Termux:Boot**
+Sans cette étape, Android peut tuer le serveur en arrière-plan :
 
-## Security
+**Paramètres → Batterie → Optimisation des applications**
+→ Désactiver pour **Termux** et **Termux:Boot**
 
-The API is exposed on all network interfaces with no authentication. **Do not use on public or untrusted Wi-Fi networks.**
+---
 
-## Logs
+## 📄 Logs
 
 ```bash
 tail -f ~/gemma4-server.log
 ```
+
+---
+
+## ⚠️ Sécurité
+
+L'API est exposée sur tout le réseau local **sans authentification**.
+Ne l'utilise pas sur un réseau Wi-Fi public ou non sécurisé.

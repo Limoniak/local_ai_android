@@ -173,8 +173,13 @@ install_packages() {
   pkg install -y git cmake clang wget curl make
 
   if [ "$VULKAN_AVAILABLE" = true ]; then
-    log "Installation des outils Vulkan..."
-    pkg install -y vulkan-tools 2>/dev/null || warn "vulkan-tools indisponible — Vulkan peut quand même fonctionner"
+    log "Installation des paquets Vulkan (headers, loader, shaderc)..."
+    # vulkan-headers + vulkan-loader-generic = build, shaderc fournit glslc
+    if ! pkg install -y vulkan-headers vulkan-loader-generic shaderc vulkan-tools 2>/dev/null; then
+      warn "Paquets Vulkan dev indisponibles — le build Vulkan échouera probablement, fallback CPU"
+      VULKAN_AVAILABLE=false
+      NGL=0
+    fi
   fi
 
   success "Dépendances installées"
@@ -226,6 +231,8 @@ build_llamacpp() {
       if [ "$CURRENT_NGL" != "0" ]; then
         warn "Échec cmake avec Vulkan — fallback CPU..."
         CURRENT_NGL=0
+        # Nettoyer le cache CMake pour ne pas re-tenter Vulkan
+        rm -rf ./* ./.??* 2>/dev/null || true
         cmake .. -DGGML_OPENMP=ON -DCMAKE_BUILD_TYPE=Release
       else
         error "Échec de la configuration CMake"

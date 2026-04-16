@@ -57,7 +57,7 @@ usage() {
   echo ""
   echo -e "${BOLD}Usage :${RESET} bash $(basename "$0") [option] [--model <url>]"
   echo ""
-  echo "  (aucune option)    Installation complète puis démarrage optionnel"
+  echo "  (aucune option)    Menu interactif (SSH / IA / start / stop)"
   echo "  --start            Démarre le serveur sans réinstaller"
   echo "  --stop             Arrête le serveur en cours"
   echo "  --ssh              Active l'accès SSH (port 8022, auth par mot de passe)"
@@ -522,44 +522,75 @@ case "$MODE" in
     ;;
 esac
 
-# --- Installation complète ---
-print_banner
-echo ""
-
-# SSH en tout premier : si la suite échoue, tu peux debug à distance
-echo ""
-read -p "Activer l'accès SSH pour gérer le téléphone depuis ton PC ? [o/N] " SSH_CONFIRM
-if [[ "$SSH_CONFIRM" =~ ^[oOyY]$ ]]; then
-  if [ ! -d "/data/data/com.termux" ]; then
-    error "SSH impossible : ce script doit être exécuté dans Termux"
-  fi
+install_ssh_with_banner() {
+  check_termux
   pkg update -y
   setup_ssh
+  if [ -d "/data/data/com.termux.boot" ]; then
+    BOOT_AVAILABLE=true
+    setup_autostart
+  fi
   WIFI_IP=$(ip route get 1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')
   [ -z "$WIFI_IP" ] && WIFI_IP="<ip-introuvable>"
   echo ""
   echo -e "${BOLD}${GREEN}▶ SSH prêt — tu peux te connecter depuis ton PC :${RESET}"
   echo -e "  ${CYAN}ssh -p 8022 $(whoami)@${WIFI_IP}${RESET}"
   echo ""
-fi
+}
 
-check_termux
-detect_vulkan
-install_packages
-build_llamacpp
-download_model
-setup_api_key
-setup_autostart
-battery_reminder
+install_ai() {
+  check_termux
+  detect_vulkan
+  install_packages
+  build_llamacpp
+  download_model
+  setup_api_key
+  setup_autostart
+  battery_reminder
 
-echo -e "${BOLD}${GREEN}✅ Installation terminée !${RESET}"
-echo ""
-echo "  Commandes utiles :"
-echo -e "  ${CYAN}bash ${SCRIPT_PATH} --start${RESET}   Démarrer le serveur"
-echo -e "  ${CYAN}bash ${SCRIPT_PATH} --stop${RESET}    Arrêter le serveur"
-echo ""
+  echo -e "${BOLD}${GREEN}✅ Installation IA terminée !${RESET}"
+  echo ""
+  echo "  Commandes utiles :"
+  echo -e "  ${CYAN}bash ${SCRIPT_PATH} --start${RESET}   Démarrer le serveur"
+  echo -e "  ${CYAN}bash ${SCRIPT_PATH} --stop${RESET}    Arrêter le serveur"
+  echo ""
+}
 
-read -p "Lancer le serveur maintenant ? [o/N] " CONFIRM
-if [[ "$CONFIRM" =~ ^[oOyY]$ ]]; then
-  launch_server
-fi
+main_menu() {
+  while true; do
+    echo ""
+    echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════╗${RESET}"
+    echo -e "${BOLD}${GREEN}║              Local AI — Menu                 ║${RESET}"
+    echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════╝${RESET}"
+    echo ""
+    echo "  1) Installer SSH (accès distant depuis PC)"
+    echo "  2) Installer l'IA (llama.cpp + modèle)"
+    echo "  3) Tout installer (SSH puis IA)"
+    echo "  4) Démarrer le serveur"
+    echo "  5) Arrêter le serveur"
+    echo "  6) Quitter"
+    echo ""
+    read -p "Ton choix [1-6] : " CHOICE
+    echo ""
+    case "$CHOICE" in
+      1) install_ssh_with_banner ;;
+      2) install_ai
+         read -p "Lancer le serveur maintenant ? [o/N] " CONFIRM
+         [[ "$CONFIRM" =~ ^[oOyY]$ ]] && { launch_server; return; }
+         ;;
+      3) install_ssh_with_banner
+         install_ai
+         read -p "Lancer le serveur maintenant ? [o/N] " CONFIRM
+         [[ "$CONFIRM" =~ ^[oOyY]$ ]] && { launch_server; return; }
+         ;;
+      4) check_termux; launch_server; return ;;
+      5) stop_server ;;
+      6) echo "Au revoir !"; return ;;
+      *) warn "Choix invalide : $CHOICE" ;;
+    esac
+  done
+}
+
+# --- Menu interactif par défaut ---
+print_banner
+main_menu

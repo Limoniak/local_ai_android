@@ -1,0 +1,17 @@
+# Local AI runtime artifacts (if someone tests in-repo)
+*.gguf
+*.log
+.ngl
+.api_key
+setup.sh
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Temporary
+*.tmp
+*.bak
+*~

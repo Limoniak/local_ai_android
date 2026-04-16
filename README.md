@@ -64,14 +64,26 @@ PORT=9090 THREADS=6 CONTEXT=8192 bash setup.sh --start
 
 ---
 
+## 🔐 Authentification
+
+À l'installation, une **clé API est générée automatiquement** et sauvegardée dans `~/gemma4/.api_key`. Elle est affichée au démarrage du serveur.
+
+**Options :**
+- `API_KEY="ma-cle"` pour fournir ta propre clé
+- `NO_AUTH=1 bash setup.sh --start` pour désactiver l'auth (à tes risques)
+
+---
+
 ## 🌐 Appeler l'API depuis un autre appareil
 
 ```bash
 # Lister les modèles disponibles
-curl http://<ip-du-téléphone>:8080/v1/models
+curl http://<ip-du-téléphone>:8080/v1/models \
+  -H "Authorization: Bearer <ta-clé-api>"
 
 # Chat
 curl http://<ip-du-téléphone>:8080/v1/chat/completions \
+  -H "Authorization: Bearer <ta-clé-api>" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "gemma-4-e2b-it-Q4_K_M",
@@ -79,7 +91,7 @@ curl http://<ip-du-téléphone>:8080/v1/chat/completions \
   }'
 ```
 
-L'IP du téléphone est affichée au démarrage du serveur.
+L'IP et la clé sont affichées au démarrage du serveur.
 
 ### Clients compatibles
 
@@ -151,5 +163,12 @@ tail -f ~/gemma4-server.log
 
 ## ⚠️ Sécurité
 
-L'API est exposée sur tout le réseau local **sans authentification**.
-Ne l'utilise pas sur un réseau Wi-Fi public ou non sécurisé.
+- L'API est exposée sur **toutes les interfaces réseau** (`0.0.0.0`). Utilise uniquement sur un réseau Wi-Fi de confiance.
+- Une **clé API est activée par défaut** — ne la partage pas et stocke-la en sûreté (`~/gemma4/.api_key`).
+- Ne désactive `NO_AUTH=1` que si tu comprends les risques.
+
+---
+
+## 📜 Licence
+
+MIT — voir [LICENSE](LICENSE)

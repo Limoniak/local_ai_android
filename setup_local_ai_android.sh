@@ -15,13 +15,20 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 INSTALL_DIR="$HOME/gemma4"
 MODEL_FILE="${MODEL_FILE:-gemma-4-e2b-it-Q4_K_M.gguf}"
 MODEL_URL="${MODEL_URL:-https://huggingface.co/bartowski/gemma-4-e2b-it-GGUF/resolve/main/${MODEL_FILE}}"
-MODEL_SHA256=""
 BOOT_SCRIPT="$HOME/.termux/boot/start-gemma.sh"
 LOG_FILE="$HOME/gemma4-server.log"
 PORT="${PORT:-8080}"
 THREADS="${THREADS:-4}"
 CONTEXT="${CONTEXT:-4096}"
+API_KEY="${API_KEY:-}"
+NO_AUTH="${NO_AUTH:-0}"
+
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+  echo "[ERR] PORT invalide : '$PORT' (doit être 1-65535)" >&2
+  exit 1
+fi
 NGL_FILE="$INSTALL_DIR/.ngl"
+API_KEY_FILE="$INSTALL_DIR/.api_key"
 
 BOOT_AVAILABLE=false
 VULKAN_AVAILABLE=false
@@ -60,7 +67,39 @@ usage() {
   echo "  PORT=8080          Port du serveur"
   echo "  THREADS=4          Nombre de threads CPU"
   echo "  CONTEXT=4096       Taille du contexte en tokens"
+  echo "  API_KEY=...        Clé API personnalisée (sinon auto-générée)"
+  echo "  NO_AUTH=1          Désactive l'authentification (non recommandé)"
   echo ""
+}
+
+# ============================================================
+# Configuration clé API
+# ============================================================
+setup_api_key() {
+  step "Configuration de la clé API"
+
+  if [ "$NO_AUTH" = "1" ]; then
+    warn "NO_AUTH=1 — serveur lancé SANS authentification"
+    rm -f "$API_KEY_FILE"
+    API_KEY=""
+    return
+  fi
+
+  mkdir -p "$INSTALL_DIR"
+
+  if [ -n "$API_KEY" ]; then
+    echo "$API_KEY" > "$API_KEY_FILE"
+    chmod 600 "$API_KEY_FILE"
+    success "Clé API personnalisée enregistrée"
+  elif [ -f "$API_KEY_FILE" ]; then
+    API_KEY=$(cat "$API_KEY_FILE")
+    success "Clé API existante réutilisée"
+  else
+    API_KEY=$(head -c 32 /dev/urandom | base64 | tr -d '/+=\n' | head -c 32)
+    echo "$API_KEY" > "$API_KEY_FILE"
+    chmod 600 "$API_KEY_FILE"
+    success "Clé API générée automatiquement"
+  fi
 }
 
 # ============================================================
@@ -89,7 +128,7 @@ check_termux() {
 detect_vulkan() {
   step "Détection de l'accélération GPU (Vulkan)"
 
-  if [ -f "/system/lib64/libvulkan.so" ] || [ -f "/vendor/lib64/vulkan.so" ]; then
+  if [ -f "/system/lib64/libvulkan.so" ] || [ -f "/vendor/lib64/libvulkan.so" ]; then
     VULKAN_AVAILABLE=true
     NGL=99
     success "Vulkan détecté — accélération GPU activée (-ngl 99)"
@@ -108,8 +147,8 @@ install_packages() {
   log "Mise à jour des paquets..."
   pkg update -y && pkg upgrade -y
 
-  log "Installation de : git cmake clang wget make..."
-  pkg install -y git cmake clang wget make
+  log "Installation de : git cmake clang wget curl make..."
+  pkg install -y git cmake clang wget curl make
 
   if [ "$VULKAN_AVAILABLE" = true ]; then
     log "Installation des outils Vulkan..."
@@ -153,18 +192,18 @@ build_llamacpp() {
     cd build
 
     log "Configuration CMake..."
-    CMAKE_FLAGS="-DGGML_OPENMP=ON -DCMAKE_BUILD_TYPE=Release"
+    CMAKE_FLAGS=(-DGGML_OPENMP=ON -DCMAKE_BUILD_TYPE=Release)
+    CURRENT_NGL=$NGL
 
     if [ "$VULKAN_AVAILABLE" = true ]; then
       log "Ajout du support Vulkan..."
-      CMAKE_FLAGS="$CMAKE_FLAGS -DGGML_VULKAN=ON"
+      CMAKE_FLAGS+=(-DGGML_VULKAN=ON)
     fi
 
-    if ! cmake .. $CMAKE_FLAGS; then
-      if [ "$VULKAN_AVAILABLE" = true ]; then
+    if ! cmake .. "${CMAKE_FLAGS[@]}"; then
+      if [ "$CURRENT_NGL" != "0" ]; then
         warn "Échec cmake avec Vulkan — fallback CPU..."
-        VULKAN_AVAILABLE=false
-        NGL=0
+        CURRENT_NGL=0
         cmake .. -DGGML_OPENMP=ON -DCMAKE_BUILD_TYPE=Release
       else
         error "Échec de la configuration CMake"
@@ -175,10 +214,10 @@ build_llamacpp() {
     JOBS=$(( $(nproc) > 2 ? 2 : $(nproc) ))
     log "Compilation avec -j${JOBS} (10-20 minutes)..."
     make -j"$JOBS" llama-server
-  )
 
-  # Sauvegarder le mode GPU pour les lancements futurs
-  echo "$NGL" > "$NGL_FILE"
+    # Sauvegarder depuis le subshell — NGL modifié ici ne remonte pas au parent
+    echo "$CURRENT_NGL" > "$NGL_FILE"
+  )
 
   success "llama-server compilé avec succès"
 }
@@ -198,19 +237,13 @@ download_model() {
 
   log "Modèle    : $MODEL_FILE"
   log "Source    : $MODEL_URL"
-  wget -c --show-progress -O "$MODEL_PATH" "$MODEL_URL"
 
-  if [ -n "$MODEL_SHA256" ]; then
-    log "Vérification de l'intégrité..."
-    echo "${MODEL_SHA256}  ${MODEL_PATH}" | sha256sum -c - || {
-      rm -f "$MODEL_PATH"
-      error "Checksum invalide ! Fichier supprimé. Relance le script."
-    }
-    success "Intégrité vérifiée"
-  else
-    warn "Aucun checksum configuré — intégrité du modèle non vérifiée."
-  fi
+  # Téléchargement dans un .tmp puis rename : évite les fichiers partiels
+  # considérés comme complets si le téléchargement est interrompu
+  MODEL_TMP="${MODEL_PATH}.tmp"
+  wget -c --show-progress -O "$MODEL_TMP" "$MODEL_URL"
 
+  mv "$MODEL_TMP" "$MODEL_PATH"
   success "Modèle téléchargé : $MODEL_PATH"
 }
 
@@ -229,19 +262,32 @@ setup_autostart() {
 
   cat > "$BOOT_SCRIPT" << BOOTEOF
 #!/data/data/com.termux/files/usr/bin/bash
-sleep 30
 
 LLAMA_BIN="${INSTALL_DIR}/llama.cpp/build/bin/llama-server"
 MODEL="${INSTALL_DIR}/${MODEL_FILE}"
 LOG="${LOG_FILE}"
 NGL=\$(cat "${NGL_FILE}" 2>/dev/null || echo 0)
+API_KEY=\$(cat "${API_KEY_FILE}" 2>/dev/null || echo "")
 
-if pgrep -f llama-server > /dev/null; then
+# Attendre que le Wi-Fi soit up (max 120s)
+for i in \$(seq 1 60); do
+  ip route get 1 &>/dev/null && break
+  sleep 2
+done
+
+if pgrep -x llama-server > /dev/null; then
   echo "[BOOT] llama-server déjà en cours" >> "\$LOG"
   exit 0
 fi
 
+# Empêcher Android de suspendre le CPU
+command -v termux-wake-lock &>/dev/null && termux-wake-lock
+
 echo "[BOOT] \$(date) — Démarrage de llama-server (ngl=\$NGL)" >> "\$LOG"
+
+AUTH_ARGS=()
+[ -n "\$API_KEY" ] && AUTH_ARGS=(--api-key "\$API_KEY")
+
 "\$LLAMA_BIN" \\
   -m "\$MODEL" \\
   --host 0.0.0.0 \\
@@ -249,6 +295,7 @@ echo "[BOOT] \$(date) — Démarrage de llama-server (ngl=\$NGL)" >> "\$LOG"
   -ngl "\$NGL" \\
   -t ${THREADS} \\
   -c ${CONTEXT} \\
+  "\${AUTH_ARGS[@]}" \\
   >> "\$LOG" 2>&1 &
 
 echo "[BOOT] PID: \$!" >> "\$LOG"
@@ -292,6 +339,11 @@ launch_server() {
     NGL=$(cat "$NGL_FILE")
   fi
 
+  # Lire la clé API sauvegardée
+  if [ -z "$API_KEY" ] && [ -f "$API_KEY_FILE" ]; then
+    API_KEY=$(cat "$API_KEY_FILE")
+  fi
+
   WIFI_IP=$(ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1)
   if [ -z "$WIFI_IP" ]; then
     WIFI_IP=$(ip route get 1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')
@@ -301,30 +353,53 @@ launch_server() {
   GPU_MODE="CPU uniquement"
   [ "$NGL" != "0" ] && GPU_MODE="GPU Vulkan (ngl=$NGL)"
 
+  AUTH_STATUS="désactivée (NO_AUTH=1)"
+  [ -n "$API_KEY" ] && AUTH_STATUS="activée"
+
   echo ""
   echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════╗${RESET}"
   echo -e "${BOLD}${GREEN}║         Local AI — Serveur API prêt !        ║${RESET}"
   echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════╣${RESET}"
   echo -e "${BOLD}${GREEN}║${RESET}  IP du téléphone : ${BOLD}${CYAN}${WIFI_IP}${RESET}"
   echo -e "${BOLD}${GREEN}║${RESET}  API endpoint    : ${BOLD}${CYAN}http://${WIFI_IP}:${PORT}${RESET}"
-  echo -e "${BOLD}${GREEN}║${RESET}  Depuis ton PC   : ${BOLD}curl http://${WIFI_IP}:${PORT}/v1/models${RESET}"
   echo -e "${BOLD}${GREEN}║${RESET}  Mode            : ${BOLD}${GPU_MODE}${RESET}"
   echo -e "${BOLD}${GREEN}║${RESET}  Threads         : ${BOLD}${THREADS}${RESET}  |  Contexte : ${BOLD}${CONTEXT} tokens${RESET}"
-  echo -e "${BOLD}${GREEN}║${RESET}"
-  echo -e "${BOLD}${GREEN}║${RESET}  Logs : tail -f ${LOG_FILE}"
+  echo -e "${BOLD}${GREEN}║${RESET}  Auth            : ${BOLD}${AUTH_STATUS}${RESET}"
   echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════╝${RESET}"
   echo ""
-  echo -e "${YELLOW}  ⚠  API accessible à tous sur le réseau local — réseau de confiance uniquement.${RESET}"
+
+  if [ -n "$API_KEY" ]; then
+    echo -e "  ${BOLD}Clé API :${RESET} ${CYAN}${API_KEY}${RESET}"
+    echo -e "  ${BOLD}Fichier :${RESET} ${API_KEY_FILE}"
+    echo ""
+    echo -e "  ${BOLD}Exemple depuis ton PC :${RESET}"
+    echo -e "  ${CYAN}curl http://${WIFI_IP}:${PORT}/v1/models \\\\${RESET}"
+    echo -e "  ${CYAN}  -H \"Authorization: Bearer ${API_KEY}\"${RESET}"
+  else
+    echo -e "  ${YELLOW}⚠  API accessible à tous sur le réseau local sans authentification !${RESET}"
+  fi
+  echo ""
+  echo "  Logs : tail -f ${LOG_FILE}"
   echo ""
 
-  log "Démarrage du serveur (Ctrl+C pour arrêter)..."
-  "$LLAMA_BIN" \
-    -m "$MODEL_PATH" \
-    --host 0.0.0.0 \
-    --port "$PORT" \
-    -ngl "$NGL" \
-    -t "$THREADS" \
+  LAUNCH_ARGS=(
+    -m "$MODEL_PATH"
+    --host 0.0.0.0
+    --port "$PORT"
+    -ngl "$NGL"
+    -t "$THREADS"
     -c "$CONTEXT"
+  )
+  [ -n "$API_KEY" ] && LAUNCH_ARGS+=(--api-key "$API_KEY")
+
+  # Empêcher Android de suspendre le CPU pendant l'inférence
+  if command -v termux-wake-lock &>/dev/null; then
+    termux-wake-lock
+    trap 'termux-wake-unlock 2>/dev/null || true' EXIT
+  fi
+
+  log "Démarrage du serveur (Ctrl+C pour arrêter)..."
+  "$LLAMA_BIN" "${LAUNCH_ARGS[@]}"
 }
 
 # ============================================================
@@ -332,8 +407,9 @@ launch_server() {
 # ============================================================
 stop_server() {
   step "Arrêt du serveur"
-  if pgrep -f llama-server > /dev/null; then
-    pkill -f llama-server
+  if pgrep -x llama-server > /dev/null; then
+    pkill -x llama-server
+    command -v termux-wake-unlock &>/dev/null && termux-wake-unlock 2>/dev/null || true
     success "Serveur arrêté"
   else
     warn "Aucun serveur llama-server en cours d'exécution"
@@ -355,6 +431,9 @@ while [ $# -gt 0 ]; do
       [ -z "$2" ] && error "--model nécessite une URL en argument"
       MODEL_URL="$2"
       MODEL_FILE="$(basename "$2" | cut -d'?' -f1)"
+      if [[ ! "$MODEL_FILE" =~ \.gguf$ ]]; then
+        error "L'URL --model doit pointer vers un fichier .gguf (reçu: $MODEL_FILE)"
+      fi
       shift 2
       ;;
     *) error "Option inconnue : $1. Lance avec --help pour l'aide." ;;
@@ -379,7 +458,6 @@ case "$MODE" in
 esac
 
 # --- Installation complète ---
-clear
 print_banner
 echo ""
 
@@ -388,6 +466,7 @@ detect_vulkan
 install_packages
 build_llamacpp
 download_model
+setup_api_key
 setup_autostart
 battery_reminder
 

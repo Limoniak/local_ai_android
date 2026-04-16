@@ -173,10 +173,10 @@ install_packages() {
   pkg install -y git cmake clang wget curl make
 
   if [ "$VULKAN_AVAILABLE" = true ]; then
-    log "Installation des paquets Vulkan (headers, loader, shaderc)..."
-    # vulkan-headers + vulkan-loader-generic = build, shaderc fournit glslc
-    if ! pkg install -y vulkan-headers vulkan-loader-generic shaderc vulkan-tools 2>/dev/null; then
-      warn "Paquets Vulkan dev indisponibles — le build Vulkan échouera probablement, fallback CPU"
+    log "Installation des paquets Vulkan (headers, loader, shaderc, spirv)..."
+    # vulkan-headers + loader = build ; shaderc = glslc ; spirv-headers = spirv.hpp
+    if ! pkg install -y vulkan-headers vulkan-loader-generic shaderc spirv-headers spirv-tools vulkan-tools 2>/dev/null; then
+      warn "Paquets Vulkan dev indisponibles — fallback CPU direct"
       VULKAN_AVAILABLE=false
       NGL=0
     fi
@@ -242,7 +242,18 @@ build_llamacpp() {
     # Max 2 threads pour éviter la surchauffe pendant la compilation
     JOBS=$(( $(nproc) > 2 ? 2 : $(nproc) ))
     log "Compilation avec -j${JOBS} (10-20 minutes)..."
-    make -j"$JOBS" llama-server
+
+    if ! make -j"$JOBS" llama-server; then
+      if [ "$CURRENT_NGL" != "0" ]; then
+        warn "Échec make avec Vulkan — fallback CPU (recompilation complète)..."
+        CURRENT_NGL=0
+        rm -rf ./* ./.??* 2>/dev/null || true
+        cmake .. -DGGML_OPENMP=ON -DCMAKE_BUILD_TYPE=Release
+        make -j"$JOBS" llama-server
+      else
+        error "Échec de la compilation"
+      fi
+    fi
 
     # Sauvegarder depuis le subshell — NGL modifié ici ne remonte pas au parent
     echo "$CURRENT_NGL" > "$NGL_FILE"

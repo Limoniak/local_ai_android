@@ -1,7 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # ============================================================
-#  GEMMA 4 — Setup automatique pour Termux (OnePlus 7T)
-#  Usage : bash setup_local_ai_android.sh [--start]
+#  Local AI — Setup automatique pour Termux (Android)
+#  Usage : bash setup_local_ai_android.sh [--start|--stop|--help]
+#  Repo  : https://github.com/Limoniak/local_ai_android
 # ============================================================
 
 set -e
@@ -10,16 +11,21 @@ set -e
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
+# --- Config (overridable via variables d'env) ---
 INSTALL_DIR="$HOME/gemma4"
-MODEL_FILE="gemma-4-e2b-it-Q4_K_M.gguf"
-MODEL_URL="https://huggingface.co/bartowski/gemma-4-e2b-it-GGUF/resolve/main/${MODEL_FILE}"
-# SHA256 du modèle — trouve-le sur la page HuggingFace du modèle (onglet "Files").
-# Laisse vide pour désactiver la vérification.
+MODEL_FILE="${MODEL_FILE:-gemma-4-e2b-it-Q4_K_M.gguf}"
+MODEL_URL="${MODEL_URL:-https://huggingface.co/bartowski/gemma-4-e2b-it-GGUF/resolve/main/${MODEL_FILE}}"
 MODEL_SHA256=""
 BOOT_SCRIPT="$HOME/.termux/boot/start-gemma.sh"
 LOG_FILE="$HOME/gemma4-server.log"
-PORT=8080
+PORT="${PORT:-8080}"
+THREADS="${THREADS:-4}"
+CONTEXT="${CONTEXT:-4096}"
+NGL_FILE="$INSTALL_DIR/.ngl"
+
 BOOT_AVAILABLE=false
+VULKAN_AVAILABLE=false
+NGL=0
 
 # ============================================================
 print_banner() {
@@ -30,7 +36,7 @@ cat << 'EOF'
 | |_| |  __/ | | | | | | | | | | (_| |__   _|
  \____|\___|_| |_| |_|_| |_| |_|\__,_|  |_|
 
-  Setup automatique — OnePlus 7T / Termux
+  Local AI — Android / Termux
 EOF
 }
 
@@ -39,6 +45,23 @@ success() { echo -e "${GREEN}[OK]${RESET}    $1"; }
 warn()    { echo -e "${YELLOW}[WARN]${RESET}  $1"; }
 error()   { echo -e "${RED}[ERR]${RESET}   $1"; exit 1; }
 step()    { echo -e "\n${BOLD}${GREEN}▶ $1${RESET}"; }
+
+usage() {
+  echo ""
+  echo -e "${BOLD}Usage :${RESET} bash $(basename "$0") [option] [--model <url>]"
+  echo ""
+  echo "  (aucune option)    Installation complète puis démarrage optionnel"
+  echo "  --start            Démarre le serveur sans réinstaller"
+  echo "  --stop             Arrête le serveur en cours"
+  echo "  --model <url>      Utilise un autre modèle GGUF (ex: depuis HuggingFace)"
+  echo "  --help             Affiche cette aide"
+  echo ""
+  echo -e "${BOLD}Variables d'environnement :${RESET}"
+  echo "  PORT=8080          Port du serveur"
+  echo "  THREADS=4          Nombre de threads CPU"
+  echo "  CONTEXT=4096       Taille du contexte en tokens"
+  echo ""
+}
 
 # ============================================================
 # ÉTAPE 0 — Vérifications
@@ -51,12 +74,29 @@ check_termux() {
   success "Termux détecté"
 
   if [ ! -d "/data/data/com.termux.boot" ]; then
-    warn "Termux:Boot n'est pas installé. Le démarrage automatique ne fonctionnera pas."
-    warn "Installe Termux:Boot depuis F-Droid, puis relance ce script."
+    warn "Termux:Boot absent — démarrage auto au reboot désactivé."
+    warn "Installe Termux:Boot depuis F-Droid pour l'activer."
     BOOT_AVAILABLE=false
   else
     success "Termux:Boot détecté"
     BOOT_AVAILABLE=true
+  fi
+}
+
+# ============================================================
+# ÉTAPE 0b — Détection Vulkan
+# ============================================================
+detect_vulkan() {
+  step "Détection de l'accélération GPU (Vulkan)"
+
+  if [ -f "/system/lib64/libvulkan.so" ] || [ -f "/vendor/lib64/vulkan.so" ]; then
+    VULKAN_AVAILABLE=true
+    NGL=99
+    success "Vulkan détecté — accélération GPU activée (-ngl 99)"
+  else
+    VULKAN_AVAILABLE=false
+    NGL=0
+    warn "Vulkan non détecté — inférence CPU uniquement (-ngl 0)"
   fi
 }
 
@@ -68,8 +108,13 @@ install_packages() {
   log "Mise à jour des paquets..."
   pkg update -y && pkg upgrade -y
 
-  log "Installation de : git cmake clang wget python make..."
-  pkg install -y git cmake clang wget python make
+  log "Installation de : git cmake clang wget make..."
+  pkg install -y git cmake clang wget make
+
+  if [ "$VULKAN_AVAILABLE" = true ]; then
+    log "Installation des outils Vulkan..."
+    pkg install -y vulkan-tools 2>/dev/null || warn "vulkan-tools indisponible — Vulkan peut quand même fonctionner"
+  fi
 
   success "Dépendances installées"
 }
@@ -83,12 +128,15 @@ build_llamacpp() {
   if [ -f "$INSTALL_DIR/llama.cpp/build/bin/llama-server" ]; then
     warn "llama-server déjà compilé, on passe cette étape."
     warn "Pour forcer la recompilation : rm -rf $INSTALL_DIR/llama.cpp/build et relancer."
+    # Restaurer le NGL stocké lors de la précédente compilation
+    if [ -f "$NGL_FILE" ]; then
+      NGL=$(cat "$NGL_FILE")
+    fi
     return
   fi
 
   mkdir -p "$INSTALL_DIR"
 
-  # Subshell pour isoler les cd du reste du script
   (
     cd "$INSTALL_DIR"
 
@@ -96,7 +144,7 @@ build_llamacpp() {
       log "Clonage de llama.cpp..."
       git clone --depth=1 https://github.com/ggerganov/llama.cpp
     else
-      log "Dossier llama.cpp déjà présent, mise à jour..."
+      log "Dossier llama.cpp présent, mise à jour..."
       cd llama.cpp && git pull && cd ..
     fi
 
@@ -105,16 +153,32 @@ build_llamacpp() {
     cd build
 
     log "Configuration CMake..."
-    cmake .. \
-      -DGGML_OPENMP=ON \
-      -DLLAMA_BUILD_SERVER=ON \
-      -DCMAKE_BUILD_TYPE=Release
+    CMAKE_FLAGS="-DGGML_OPENMP=ON -DCMAKE_BUILD_TYPE=Release"
 
-    # Limité à 2 threads pour éviter la surchauffe sur mobile
+    if [ "$VULKAN_AVAILABLE" = true ]; then
+      log "Ajout du support Vulkan..."
+      CMAKE_FLAGS="$CMAKE_FLAGS -DGGML_VULKAN=ON"
+    fi
+
+    if ! cmake .. $CMAKE_FLAGS; then
+      if [ "$VULKAN_AVAILABLE" = true ]; then
+        warn "Échec cmake avec Vulkan — fallback CPU..."
+        VULKAN_AVAILABLE=false
+        NGL=0
+        cmake .. -DGGML_OPENMP=ON -DCMAKE_BUILD_TYPE=Release
+      else
+        error "Échec de la configuration CMake"
+      fi
+    fi
+
+    # Max 2 threads pour éviter la surchauffe pendant la compilation
     JOBS=$(( $(nproc) > 2 ? 2 : $(nproc) ))
-    log "Compilation avec -j${JOBS} (peut prendre 10-20 minutes)..."
+    log "Compilation avec -j${JOBS} (10-20 minutes)..."
     make -j"$JOBS" llama-server
   )
+
+  # Sauvegarder le mode GPU pour les lancements futurs
+  echo "$NGL" > "$NGL_FILE"
 
   success "llama-server compilé avec succès"
 }
@@ -123,7 +187,7 @@ build_llamacpp() {
 # ÉTAPE 3 — Télécharger le modèle
 # ============================================================
 download_model() {
-  step "Téléchargement du modèle Gemma 4 E2B"
+  step "Téléchargement du modèle"
   MODEL_PATH="$INSTALL_DIR/$MODEL_FILE"
 
   if [ -f "$MODEL_PATH" ]; then
@@ -132,12 +196,12 @@ download_model() {
     return
   fi
 
-  log "Téléchargement depuis Hugging Face (~1.3 Go)..."
-  log "URL : $MODEL_URL"
+  log "Modèle    : $MODEL_FILE"
+  log "Source    : $MODEL_URL"
   wget -c --show-progress -O "$MODEL_PATH" "$MODEL_URL"
 
   if [ -n "$MODEL_SHA256" ]; then
-    log "Vérification de l'intégrité du modèle..."
+    log "Vérification de l'intégrité..."
     echo "${MODEL_SHA256}  ${MODEL_PATH}" | sha256sum -c - || {
       rm -f "$MODEL_PATH"
       error "Checksum invalide ! Fichier supprimé. Relance le script."
@@ -165,25 +229,26 @@ setup_autostart() {
 
   cat > "$BOOT_SCRIPT" << BOOTEOF
 #!/data/data/com.termux/files/usr/bin/bash
-# Démarrage automatique de Gemma 4 après reboot
 sleep 30
 
 LLAMA_BIN="${INSTALL_DIR}/llama.cpp/build/bin/llama-server"
 MODEL="${INSTALL_DIR}/${MODEL_FILE}"
 LOG="${LOG_FILE}"
+NGL=\$(cat "${NGL_FILE}" 2>/dev/null || echo 0)
 
 if pgrep -f llama-server > /dev/null; then
   echo "[BOOT] llama-server déjà en cours" >> "\$LOG"
   exit 0
 fi
 
-echo "[BOOT] \$(date) — Démarrage de llama-server" >> "\$LOG"
+echo "[BOOT] \$(date) — Démarrage de llama-server (ngl=\$NGL)" >> "\$LOG"
 "\$LLAMA_BIN" \\
   -m "\$MODEL" \\
   --host 0.0.0.0 \\
   --port ${PORT} \\
-  -ngl 0 \\
-  -c 2048 \\
+  -ngl "\$NGL" \\
+  -t ${THREADS} \\
+  -c ${CONTEXT} \\
   >> "\$LOG" 2>&1 &
 
 echo "[BOOT] PID: \$!" >> "\$LOG"
@@ -194,20 +259,20 @@ BOOTEOF
 }
 
 # ============================================================
-# ÉTAPE 5 — Désactiver l'optimisation batterie (rappel)
+# ÉTAPE 5 — Rappel optimisation batterie
 # ============================================================
 battery_reminder() {
   step "Optimisation batterie"
   echo ""
   echo -e "${YELLOW}  ⚡ ACTION MANUELLE REQUISE :${RESET}"
-  echo "  Va dans : Paramètres → Batterie → Optimisation des applis"
-  echo "  Puis désactive l'optimisation pour : Termux et Termux:Boot"
+  echo "  Paramètres → Batterie → Optimisation des applications"
+  echo "  → Désactiver pour : Termux et Termux:Boot"
   echo "  Sans ça, Android peut tuer le serveur en arrière-plan."
   echo ""
 }
 
 # ============================================================
-# ÉTAPE 6 — Afficher l'IP et lancer le serveur
+# Lancer le serveur
 # ============================================================
 launch_server() {
   step "Lancement du serveur"
@@ -222,24 +287,34 @@ launch_server() {
     error "Modèle introuvable : $MODEL_PATH. Lance d'abord l'installation complète (sans --start)."
   fi
 
+  # Lire le mode GPU de la compilation
+  if [ -f "$NGL_FILE" ]; then
+    NGL=$(cat "$NGL_FILE")
+  fi
+
   WIFI_IP=$(ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1)
   if [ -z "$WIFI_IP" ]; then
-    WIFI_IP=$(ip route get 1 2>/dev/null | awk '{print $7; exit}')
+    WIFI_IP=$(ip route get 1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')
   fi
+  [ -z "$WIFI_IP" ] && WIFI_IP="<ip-introuvable>"
+
+  GPU_MODE="CPU uniquement"
+  [ "$NGL" != "0" ] && GPU_MODE="GPU Vulkan (ngl=$NGL)"
 
   echo ""
   echo -e "${BOLD}${GREEN}╔══════════════════════════════════════════════╗${RESET}"
-  echo -e "${BOLD}${GREEN}║         GEMMA 4 — Serveur API prêt !         ║${RESET}"
+  echo -e "${BOLD}${GREEN}║         Local AI — Serveur API prêt !        ║${RESET}"
   echo -e "${BOLD}${GREEN}╠══════════════════════════════════════════════╣${RESET}"
   echo -e "${BOLD}${GREEN}║${RESET}  IP du téléphone : ${BOLD}${CYAN}${WIFI_IP}${RESET}"
   echo -e "${BOLD}${GREEN}║${RESET}  API endpoint    : ${BOLD}${CYAN}http://${WIFI_IP}:${PORT}${RESET}"
   echo -e "${BOLD}${GREEN}║${RESET}  Depuis ton PC   : ${BOLD}curl http://${WIFI_IP}:${PORT}/v1/models${RESET}"
+  echo -e "${BOLD}${GREEN}║${RESET}  Mode            : ${BOLD}${GPU_MODE}${RESET}"
+  echo -e "${BOLD}${GREEN}║${RESET}  Threads         : ${BOLD}${THREADS}${RESET}  |  Contexte : ${BOLD}${CONTEXT} tokens${RESET}"
   echo -e "${BOLD}${GREEN}║${RESET}"
   echo -e "${BOLD}${GREEN}║${RESET}  Logs : tail -f ${LOG_FILE}"
   echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════╝${RESET}"
   echo ""
-  echo -e "${YELLOW}  ⚠  L'API est accessible à tous sur le réseau Wi-Fi local.${RESET}"
-  echo -e "${YELLOW}     Ne l'utilise pas sur un réseau public non sécurisé.${RESET}"
+  echo -e "${YELLOW}  ⚠  API accessible à tous sur le réseau local — réseau de confiance uniquement.${RESET}"
   echo ""
 
   log "Démarrage du serveur (Ctrl+C pour arrêter)..."
@@ -247,27 +322,69 @@ launch_server() {
     -m "$MODEL_PATH" \
     --host 0.0.0.0 \
     --port "$PORT" \
-    -ngl 0 \
-    -c 2048
+    -ngl "$NGL" \
+    -t "$THREADS" \
+    -c "$CONTEXT"
 }
 
 # ============================================================
-# MAIN
+# Arrêter le serveur
+# ============================================================
+stop_server() {
+  step "Arrêt du serveur"
+  if pgrep -f llama-server > /dev/null; then
+    pkill -f llama-server
+    success "Serveur arrêté"
+  else
+    warn "Aucun serveur llama-server en cours d'exécution"
+  fi
+}
+
+# ============================================================
+# MAIN — Parsing des arguments
 # ============================================================
 SCRIPT_PATH="$(realpath "$0")"
+MODE="install"
 
-# Mode --start : bypass l'installation, lance juste le serveur
-if [ "$1" = "--start" ]; then
-  check_termux
-  launch_server
-  exit 0
-fi
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --start)        MODE="start"; shift ;;
+    --stop)         MODE="stop";  shift ;;
+    --help|-h)      MODE="help";  shift ;;
+    --model)
+      [ -z "$2" ] && error "--model nécessite une URL en argument"
+      MODEL_URL="$2"
+      MODEL_FILE="$(basename "$2" | cut -d'?' -f1)"
+      shift 2
+      ;;
+    *) error "Option inconnue : $1. Lance avec --help pour l'aide." ;;
+  esac
+done
 
+case "$MODE" in
+  help)
+    print_banner
+    usage
+    exit 0
+    ;;
+  stop)
+    stop_server
+    exit 0
+    ;;
+  start)
+    check_termux
+    launch_server
+    exit 0
+    ;;
+esac
+
+# --- Installation complète ---
 clear
 print_banner
 echo ""
 
 check_termux
+detect_vulkan
 install_packages
 build_llamacpp
 download_model
@@ -276,15 +393,12 @@ battery_reminder
 
 echo -e "${BOLD}${GREEN}✅ Installation terminée !${RESET}"
 echo ""
-echo "  Pour relancer manuellement le serveur plus tard :"
-echo -e "  ${CYAN}bash ${SCRIPT_PATH} --start${RESET}"
+echo "  Commandes utiles :"
+echo -e "  ${CYAN}bash ${SCRIPT_PATH} --start${RESET}   Démarrer le serveur"
+echo -e "  ${CYAN}bash ${SCRIPT_PATH} --stop${RESET}    Arrêter le serveur"
 echo ""
 
 read -p "Lancer le serveur maintenant ? [o/N] " CONFIRM
 if [[ "$CONFIRM" =~ ^[oOyY]$ ]]; then
   launch_server
-else
-  echo ""
-  echo "  Lance le serveur quand tu veux avec :"
-  echo -e "  ${CYAN}bash ${SCRIPT_PATH} --start${RESET}"
 fi

@@ -527,18 +527,26 @@ print_banner
 echo ""
 
 check_termux
+
+# SSH en premier : si la suite échoue, tu peux debug à distance
+echo ""
+read -p "Activer l'accès SSH pour gérer le téléphone depuis ton PC ? [o/N] " SSH_CONFIRM
+if [[ "$SSH_CONFIRM" =~ ^[oOyY]$ ]]; then
+  pkg update -y
+  setup_ssh
+  WIFI_IP=$(ip route get 1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')
+  [ -z "$WIFI_IP" ] && WIFI_IP="<ip-introuvable>"
+  echo ""
+  echo -e "${BOLD}${GREEN}▶ SSH prêt — tu peux te connecter depuis ton PC :${RESET}"
+  echo -e "  ${CYAN}ssh -p 8022 $(whoami)@${WIFI_IP}${RESET}"
+  echo ""
+fi
+
 detect_vulkan
 install_packages
 build_llamacpp
 download_model
 setup_api_key
-
-echo ""
-read -p "Activer l'accès SSH pour gérer le téléphone depuis ton PC ? [o/N] " SSH_CONFIRM
-if [[ "$SSH_CONFIRM" =~ ^[oOyY]$ ]]; then
-  setup_ssh
-fi
-
 setup_autostart
 battery_reminder
 

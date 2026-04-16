@@ -190,7 +190,8 @@ ip addr show wlan0
 ## 📄 Logs
 
 ```bash
-tail -f ~/gemma4-server.log
+tail -f ~/gemma4-server.log      # Serveur en cours d'exécution
+tail -f ~/gemma4-install.log     # Toutes les étapes d'installation
 ```
 
 ---

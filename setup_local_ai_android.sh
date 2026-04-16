@@ -17,6 +17,7 @@ MODEL_FILE="${MODEL_FILE:-gemma-4-e2b-it-Q4_K_M.gguf}"
 MODEL_URL="${MODEL_URL:-https://huggingface.co/bartowski/gemma-4-e2b-it-GGUF/resolve/main/${MODEL_FILE}}"
 BOOT_SCRIPT="$HOME/.termux/boot/start-gemma.sh"
 LOG_FILE="$HOME/gemma4-server.log"
+INSTALL_LOG="$HOME/gemma4-install.log"
 PORT="${PORT:-8080}"
 THREADS="${THREADS:-4}"
 CONTEXT="${CONTEXT:-4096}"
@@ -476,6 +477,10 @@ stop_server() {
 SCRIPT_PATH="$(realpath "$0")"
 MODE="install"
 
+# Tout ce qui suit est écrit à la fois à l'écran ET dans $INSTALL_LOG
+mkdir -p "$(dirname "$INSTALL_LOG")"
+exec > >(tee -a "$INSTALL_LOG") 2>&1
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --start)        MODE="start"; shift ;;
@@ -522,7 +527,16 @@ case "$MODE" in
     ;;
 esac
 
+log_session_header() {
+  echo ""
+  echo "═══════════════════════════════════════════════════════"
+  echo "  Session : $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "  Action  : $1"
+  echo "═══════════════════════════════════════════════════════"
+}
+
 install_ssh_with_banner() {
+  log_session_header "Installation SSH"
   check_termux
   pkg update -y
   setup_ssh
@@ -535,10 +549,12 @@ install_ssh_with_banner() {
   echo ""
   echo -e "${BOLD}${GREEN}▶ SSH prêt — tu peux te connecter depuis ton PC :${RESET}"
   echo -e "  ${CYAN}ssh -p 8022 $(whoami)@${WIFI_IP}${RESET}"
+  echo -e "  ${CYAN}Log d'installation : ${INSTALL_LOG}${RESET}"
   echo ""
 }
 
 install_ai() {
+  log_session_header "Installation IA"
   check_termux
   detect_vulkan
   install_packages
@@ -553,6 +569,7 @@ install_ai() {
   echo "  Commandes utiles :"
   echo -e "  ${CYAN}bash ${SCRIPT_PATH} --start${RESET}   Démarrer le serveur"
   echo -e "  ${CYAN}bash ${SCRIPT_PATH} --stop${RESET}    Arrêter le serveur"
+  echo -e "  ${CYAN}Log d'installation : ${INSTALL_LOG}${RESET}"
   echo ""
 }
 

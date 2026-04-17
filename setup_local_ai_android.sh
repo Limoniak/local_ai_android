@@ -24,15 +24,24 @@ CONTEXT="${CONTEXT:-4096}"
 API_KEY="${API_KEY:-}"
 NO_AUTH="${NO_AUTH:-0}"
 
+# --- Optimisations runtime (surchargables) ---
+PARALLEL="${PARALLEL:-1}"          # -np : nb de slots parallèles (1 = économise KV cache × N)
+FLASH_ATTN="${FLASH_ATTN:-1}"      # -fa : flash attention (RAM + vitesse)
+MLOCK="${MLOCK:-1}"                # --mlock : verrouille le modèle en RAM (pas de swap)
+KV_QUANT="${KV_QUANT:-q8_0}"       # --cache-type-k/v : f16 | q8_0 | q4_0 (q8_0 = -50% RAM KV)
+
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
   echo "[ERR] PORT invalide : '$PORT' (doit être 1-65535)" >&2
   exit 1
 fi
 NGL_FILE="$INSTALL_DIR/.ngl"
+BACKEND_FILE="$INSTALL_DIR/.backend"
 API_KEY_FILE="$INSTALL_DIR/.api_key"
 
 BOOT_AVAILABLE=false
 VULKAN_AVAILABLE=false
+OPENCL_AVAILABLE=false
+BACKEND="cpu"
 NGL=0
 
 # ============================================================
@@ -128,18 +137,42 @@ check_termux() {
 # ============================================================
 # ÉTAPE 0b — Détection Vulkan
 # ============================================================
-detect_vulkan() {
-  step "Détection de l'accélération GPU (Vulkan)"
+detect_gpu() {
+  step "Détection de l'accélération GPU"
 
+  VULKAN_AVAILABLE=false
+  OPENCL_AVAILABLE=false
+  BACKEND="cpu"
+  NGL=0
+
+  # Marqueur utilisateur : forcer CPU-only (posé par l'option "Recompiler en CPU pur")
+  if [ -f "$INSTALL_DIR/.cpu_only" ]; then
+    warn "Marqueur .cpu_only présent — GPU désactivé volontairement"
+    return
+  fi
+
+  # 1. OpenCL — backend préféré sur Adreno (Qualcomm) et Mali, supporté nativement par llama.cpp
+  #    Pilotes Android installés par le vendor dans /vendor/lib64/libOpenCL.so
+  if [ -f "/vendor/lib64/libOpenCL.so" ] || [ -f "/system/lib64/libOpenCL.so" ] \
+     || [ -f "/system/vendor/lib64/libOpenCL.so" ]; then
+    OPENCL_AVAILABLE=true
+    BACKEND="opencl"
+    NGL=99
+    success "OpenCL détecté — accélération GPU activée (backend OpenCL, optimal sur Adreno)"
+    return
+  fi
+
+  # 2. Vulkan — fallback pour GPU Mali récents / Adreno 7xx+ (Vulkan 1.2 requis par llama.cpp)
+  #    Adreno 640 (OnePlus 7T) n'a que Vulkan 1.1 → échouera au runtime, OpenCL reste préférable
   if [ -f "/system/lib64/libvulkan.so" ] || [ -f "/vendor/lib64/libvulkan.so" ]; then
     VULKAN_AVAILABLE=true
+    BACKEND="vulkan"
     NGL=99
-    success "Vulkan détecté — accélération GPU activée (-ngl 99)"
-  else
-    VULKAN_AVAILABLE=false
-    NGL=0
-    warn "Vulkan non détecté — inférence CPU uniquement (-ngl 0)"
+    success "Vulkan détecté — accélération GPU activée (backend Vulkan, nécessite Vulkan 1.2+)"
+    return
   fi
+
+  warn "Aucun GPU détecté — inférence CPU uniquement"
 }
 
 # ============================================================
@@ -174,6 +207,38 @@ install_packages() {
   log "Installation de : git cmake clang wget curl make libandroid-spawn..."
   pkg install -y git cmake clang wget curl make libandroid-spawn
 
+  if [ "$OPENCL_AVAILABLE" = true ]; then
+    log "Installation des paquets OpenCL (headers, loader ICD)..."
+    # opencl-headers : CL/cl.h ; opencl-clhpp : API C++ ; ocl-icd : loader standard
+    # clinfo : utilitaire de diagnostic (équivalent de vulkaninfo)
+    if ! pkg install -y opencl-headers opencl-clhpp ocl-icd clinfo 2>/dev/null; then
+      warn "Paquets OpenCL indisponibles — fallback Vulkan/CPU"
+      OPENCL_AVAILABLE=false
+      BACKEND="cpu"
+      NGL=0
+      # Tenter Vulkan si libvulkan présent
+      if [ -f "/system/lib64/libvulkan.so" ] || [ -f "/vendor/lib64/libvulkan.so" ]; then
+        VULKAN_AVAILABLE=true
+        BACKEND="vulkan"
+        NGL=99
+      fi
+    else
+      # Configurer le loader ICD pour trouver le driver Android
+      # ocl-icd cherche les .icd dans /data/data/com.termux/files/usr/etc/OpenCL/vendors/
+      ICD_DIR="$PREFIX/etc/OpenCL/vendors"
+      mkdir -p "$ICD_DIR"
+      # Pointer vers le libOpenCL.so Android du vendor
+      VENDOR_OCL=""
+      for p in /vendor/lib64/libOpenCL.so /system/vendor/lib64/libOpenCL.so /system/lib64/libOpenCL.so; do
+        [ -f "$p" ] && VENDOR_OCL="$p" && break
+      done
+      if [ -n "$VENDOR_OCL" ]; then
+        echo "$VENDOR_OCL" > "$ICD_DIR/android-vendor.icd"
+        log "OpenCL ICD configuré : $VENDOR_OCL"
+      fi
+    fi
+  fi
+
   if [ "$VULKAN_AVAILABLE" = true ]; then
     log "Installation des paquets Vulkan (headers, loader Android, shaderc, spirv)..."
     # vulkan-loader-android : charge les drivers Android (ex: /vendor/lib64/hw/vulkan.adreno.so)
@@ -189,6 +254,7 @@ install_packages() {
       if ! pkg install -y vulkan-headers vulkan-loader-generic shaderc spirv-headers spirv-tools vulkan-tools 2>/dev/null; then
         warn "Paquets Vulkan dev indisponibles — fallback CPU direct"
         VULKAN_AVAILABLE=false
+        BACKEND="cpu"
         NGL=0
       fi
     fi
@@ -231,21 +297,37 @@ build_llamacpp() {
     cd build
 
     log "Configuration CMake..."
+    # GGML_NATIVE=ON    : auto-détecte NEON / fp16 / dotprod sur Snapdragon 855+
+    # GGML_LLAMAFILE=ON : kernels matmul optimisés (Mozilla Llamafile)
+    # GGML_OPENMP=ON    : parallélisme CPU multi-cœurs
     CMAKE_FLAGS=(
       -DGGML_OPENMP=ON
+      -DGGML_LLAMAFILE=ON
+      -DGGML_NATIVE=ON
       -DCMAKE_BUILD_TYPE=Release
       -DCMAKE_EXE_LINKER_FLAGS=-landroid-spawn
       -DCMAKE_SHARED_LINKER_FLAGS=-landroid-spawn
     )
     CURRENT_NGL=$NGL
+    CURRENT_BACKEND="cpu"
 
-    if [ "$VULKAN_AVAILABLE" = true ]; then
+    if [ "$OPENCL_AVAILABLE" = true ]; then
+      log "Ajout du support OpenCL (backend Adreno/Mali)..."
+      # GGML_OPENCL=ON                     : active le backend OpenCL
+      # GGML_OPENCL_USE_ADRENO_KERNELS=ON  : kernels spécialisés Adreno (Qualcomm)
+      # GGML_OPENCL_EMBED_KERNELS=ON       : embarque les .cl dans le binaire (pas de fichiers externes)
+      CMAKE_FLAGS+=(-DGGML_OPENCL=ON -DGGML_OPENCL_USE_ADRENO_KERNELS=ON -DGGML_OPENCL_EMBED_KERNELS=ON)
+      CURRENT_BACKEND="opencl"
+    elif [ "$VULKAN_AVAILABLE" = true ]; then
       log "Ajout du support Vulkan..."
       CMAKE_FLAGS+=(-DGGML_VULKAN=ON)
+      CURRENT_BACKEND="vulkan"
     fi
 
     CMAKE_CPU_FALLBACK_FLAGS=(
       -DGGML_OPENMP=ON
+      -DGGML_LLAMAFILE=ON
+      -DGGML_NATIVE=ON
       -DCMAKE_BUILD_TYPE=Release
       -DCMAKE_EXE_LINKER_FLAGS=-landroid-spawn
       -DCMAKE_SHARED_LINKER_FLAGS=-landroid-spawn
@@ -253,9 +335,10 @@ build_llamacpp() {
 
     if ! cmake .. "${CMAKE_FLAGS[@]}"; then
       if [ "$CURRENT_NGL" != "0" ]; then
-        warn "Échec cmake avec Vulkan — fallback CPU..."
+        warn "Échec cmake avec GPU ($CURRENT_BACKEND) — fallback CPU..."
         CURRENT_NGL=0
-        # Nettoyer le cache CMake pour ne pas re-tenter Vulkan
+        CURRENT_BACKEND="cpu"
+        # Nettoyer le cache CMake pour ne pas re-tenter GPU
         rm -rf ./* ./.??* 2>/dev/null || true
         cmake .. "${CMAKE_CPU_FALLBACK_FLAGS[@]}"
       else
@@ -269,8 +352,9 @@ build_llamacpp() {
 
     if ! make -j"$JOBS" llama-server; then
       if [ "$CURRENT_NGL" != "0" ]; then
-        warn "Échec make avec Vulkan — fallback CPU (recompilation complète)..."
+        warn "Échec make avec GPU ($CURRENT_BACKEND) — fallback CPU (recompilation complète)..."
         CURRENT_NGL=0
+        CURRENT_BACKEND="cpu"
         rm -rf ./* ./.??* 2>/dev/null || true
         cmake .. "${CMAKE_CPU_FALLBACK_FLAGS[@]}"
         make -j"$JOBS" llama-server
@@ -279,8 +363,9 @@ build_llamacpp() {
       fi
     fi
 
-    # Sauvegarder depuis le subshell — NGL modifié ici ne remonte pas au parent
+    # Sauvegarder depuis le subshell — les modifs ici ne remontent pas au parent
     echo "$CURRENT_NGL" > "$NGL_FILE"
+    echo "$CURRENT_BACKEND" > "$BACKEND_FILE"
   )
 
   success "llama-server compilé avec succès"
@@ -408,6 +493,9 @@ launch_server() {
   if [ -f "$NGL_FILE" ]; then
     NGL=$(cat "$NGL_FILE")
   fi
+  if [ -f "$BACKEND_FILE" ]; then
+    BACKEND=$(cat "$BACKEND_FILE")
+  fi
 
   # Lire la clé API sauvegardée
   if [ -z "$API_KEY" ] && [ -f "$API_KEY_FILE" ]; then
@@ -420,8 +508,11 @@ launch_server() {
   fi
   [ -z "$WIFI_IP" ] && WIFI_IP="<ip-introuvable>"
 
-  GPU_MODE="CPU uniquement"
-  [ "$NGL" != "0" ] && GPU_MODE="GPU Vulkan (ngl=$NGL)"
+  case "$BACKEND" in
+    opencl) GPU_MODE="GPU OpenCL (Adreno, ngl=$NGL)" ;;
+    vulkan) GPU_MODE="GPU Vulkan (ngl=$NGL)" ;;
+    *)      GPU_MODE="CPU uniquement (ngl=0)" ;;
+  esac
 
   AUTH_STATUS="désactivée (NO_AUTH=1)"
   [ -n "$API_KEY" ] && AUTH_STATUS="activée"
@@ -467,7 +558,19 @@ launch_server() {
     -ngl "$NGL"
     -t "$THREADS"
     -c "$CONTEXT"
+    -np "$PARALLEL"
   )
+
+  # KV cache quantifié — divise la RAM du cache par ~2 (f16 → q8_0) sans perte perceptible
+  # Requiert flash attention pour les types != f16
+  if [ "$KV_QUANT" != "f16" ] && [ "$FLASH_ATTN" = "1" ]; then
+    LAUNCH_ARGS+=(--cache-type-k "$KV_QUANT" --cache-type-v "$KV_QUANT")
+  fi
+  # Flash attention — accélère l'inférence et réduit la RAM (obligatoire si KV quantifié)
+  [ "$FLASH_ATTN" = "1" ] && LAUNCH_ARGS+=(-fa)
+  # mlock — empêche le swap, garde le modèle en RAM (critique sur phone)
+  [ "$MLOCK" = "1" ] && LAUNCH_ARGS+=(--mlock)
+
   [ -n "$API_KEY" ] && LAUNCH_ARGS+=(--api-key "$API_KEY")
 
   # Empêcher Android de suspendre le CPU pendant l'inférence
@@ -600,7 +703,7 @@ install_ssh_with_banner() {
 install_ai() {
   log_session_header "Installation IA"
   check_termux
-  detect_vulkan
+  detect_gpu
   install_packages
   build_llamacpp
   download_model
@@ -615,6 +718,89 @@ install_ai() {
   echo -e "  ${CYAN}bash ${SCRIPT_PATH} --stop${RESET}    Arrêter le serveur"
   echo -e "  ${CYAN}Log d'installation : ${INSTALL_LOG}${RESET}"
   echo ""
+}
+
+rebuild_cpu_only() {
+  step "Recompilation CPU uniquement"
+  echo ""
+  warn "Cette opération va :"
+  warn "  - Arrêter le serveur s'il tourne"
+  warn "  - Supprimer le build actuel (~300 Mo)"
+  warn "  - Recompiler llama.cpp en CPU pur (10-20 min)"
+  warn "  - Créer un marqueur pour désactiver Vulkan à l'avenir"
+  echo ""
+  read -p "Confirmer ? [o/N] " C
+  [[ "$C" =~ ^[oOyY]$ ]] || { warn "Annulé"; return; }
+
+  # Arrêter le serveur s'il tourne
+  if pgrep -x llama-server > /dev/null; then
+    log "Arrêt du serveur en cours..."
+    pkill -x llama-server 2>/dev/null || true
+    command -v termux-wake-unlock &>/dev/null && termux-wake-unlock 2>/dev/null || true
+    sleep 2
+  fi
+
+  # Marqueur persistant pour les futurs runs
+  mkdir -p "$INSTALL_DIR"
+  touch "$INSTALL_DIR/.cpu_only"
+
+  # Nettoyage du build Vulkan et du cache NGL
+  rm -rf "$INSTALL_DIR/llama.cpp/build"
+  rm -f "$NGL_FILE"
+
+  # Forcer CPU pour ce run
+  VULKAN_AVAILABLE=false
+  NGL=0
+
+  # Recompilation
+  check_termux
+  install_packages
+  build_llamacpp
+
+  success "Recompilation CPU terminée — lance le serveur (option 4) pour tester"
+}
+
+rebuild_gpu() {
+  step "Recompilation GPU (OpenCL prioritaire, Vulkan en fallback)"
+  echo ""
+  warn "Cette opération va :"
+  warn "  - Arrêter le serveur s'il tourne"
+  warn "  - Retirer le marqueur .cpu_only (si présent)"
+  warn "  - Supprimer le build actuel (~300 Mo)"
+  warn "  - Recompiler llama.cpp avec le backend GPU détecté (10-20 min)"
+  warn "  - Priorité : OpenCL (Adreno/Mali) > Vulkan > CPU"
+  echo ""
+  read -p "Confirmer ? [o/N] " C
+  [[ "$C" =~ ^[oOyY]$ ]] || { warn "Annulé"; return; }
+
+  # Arrêter le serveur s'il tourne
+  if pgrep -x llama-server > /dev/null; then
+    log "Arrêt du serveur en cours..."
+    pkill -x llama-server 2>/dev/null || true
+    command -v termux-wake-unlock &>/dev/null && termux-wake-unlock 2>/dev/null || true
+    sleep 2
+  fi
+
+  # Retirer le marqueur CPU-only si présent
+  rm -f "$INSTALL_DIR/.cpu_only"
+
+  # Nettoyage du build et des caches
+  rm -rf "$INSTALL_DIR/llama.cpp/build"
+  rm -f "$NGL_FILE" "$BACKEND_FILE"
+
+  # Recompilation avec détection GPU
+  check_termux
+  detect_gpu
+  install_packages
+  build_llamacpp
+
+  # Afficher ce qui a réellement été compilé
+  FINAL_BACKEND="cpu"
+  [ -f "$BACKEND_FILE" ] && FINAL_BACKEND=$(cat "$BACKEND_FILE")
+  success "Recompilation terminée — backend actif : $FINAL_BACKEND"
+  if [ "$FINAL_BACKEND" = "cpu" ]; then
+    warn "Aucun GPU utilisable détecté — compilé en CPU"
+  fi
 }
 
 status_server() {
@@ -650,6 +836,34 @@ status_server() {
     fi
   fi
 
+  # Backend compilé
+  echo ""
+  echo -e "${BOLD}Backend compilé :${RESET}"
+  if [ -f "$BACKEND_FILE" ]; then
+    COMPILED_BACKEND=$(cat "$BACKEND_FILE")
+    echo "  $COMPILED_BACKEND (ngl=$(cat "$NGL_FILE" 2>/dev/null || echo 0))"
+  else
+    warn "  Inconnu — llama.cpp pas encore compilé"
+  fi
+  [ -f "$INSTALL_DIR/.cpu_only" ] && warn "  Marqueur .cpu_only présent → GPU forcé désactivé"
+
+  # OpenCL
+  echo ""
+  echo -e "${BOLD}OpenCL :${RESET}"
+  if command -v clinfo &>/dev/null; then
+    CL_DEV=$(clinfo 2>/dev/null | grep -E "Device Name" | head -1 | sed 's/^[ \t]*//')
+    if [ -n "$CL_DEV" ]; then
+      echo "  $CL_DEV"
+    else
+      warn "  Aucun GPU détecté par clinfo"
+    fi
+  else
+    warn "  clinfo absent — installe-le via l'option 2 (Installer IA)"
+  fi
+  for p in /vendor/lib64/libOpenCL.so /system/vendor/lib64/libOpenCL.so /system/lib64/libOpenCL.so; do
+    [ -f "$p" ] && echo "  Driver Android : $p" && break
+  done
+
   # Vulkan
   echo ""
   echo -e "${BOLD}Vulkan :${RESET}"
@@ -672,8 +886,8 @@ status_server() {
   # Logs llama-server
   if [ -f "$LOG_FILE" ]; then
     echo ""
-    echo -e "${BOLD}Logs Vulkan/backend (dans $LOG_FILE) :${RESET}"
-    grep -iE "vulkan|offloaded|backend|device" "$LOG_FILE" 2>/dev/null | tail -10 | sed 's/^/  /'
+    echo -e "${BOLD}Logs backend (dans $LOG_FILE) :${RESET}"
+    grep -iE "opencl|vulkan|adreno|offloaded|backend|device" "$LOG_FILE" 2>/dev/null | tail -10 | sed 's/^/  /'
 
     echo ""
     echo -e "${BOLD}20 dernières lignes du log :${RESET}"
@@ -722,11 +936,13 @@ main_menu() {
     echo "  4) Démarrer le serveur en arrière-plan (recommandé)"
     echo "  5) Démarrer le serveur en foreground (debug, Ctrl+C pour quitter)"
     echo "  6) Arrêter le serveur"
-    echo "  7) Statut & diagnostic (IP, Vulkan, logs)"
+    echo "  7) Statut & diagnostic (IP, backend, OpenCL/Vulkan, logs)"
     echo "  8) Changer de modèle"
-    echo "  9) Quitter"
+    echo "  9) Recompiler avec GPU (OpenCL prioritaire, recommandé sur Adreno)"
+    echo " 10) Recompiler en CPU pur (si GPU incompatible)"
+    echo "  0) Quitter"
     echo ""
-    read -p "Ton choix [1-9] : " CHOICE
+    read -p "Ton choix [0-10] : " CHOICE
     echo ""
     case "$CHOICE" in
       1) install_ssh_with_banner ;;
@@ -748,7 +964,9 @@ main_menu() {
       6) stop_server ;;
       7) status_server ;;
       8) change_model_menu ;;
-      9) echo "Au revoir !"; return ;;
+      9) rebuild_gpu ;;
+      10) rebuild_cpu_only ;;
+      0) echo "Au revoir !"; return ;;
       *) warn "Choix invalide : $CHOICE" ;;
     esac
   done

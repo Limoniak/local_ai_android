@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash -n \"c:/Users/bapti/Documents/GitHub/local_ai_android/setup_local_ai_android.sh\")",
+      "Bash(\"C:/Program Files/Git/bin/bash.exe\" -n \"c:/Users/bapti/Documents/GitHub/local_ai_android/setup_local_ai_android.sh\")"
+    ]
+  }
+}

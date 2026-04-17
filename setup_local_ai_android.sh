@@ -59,7 +59,8 @@ usage() {
   echo -e "${BOLD}Usage :${RESET} bash $(basename "$0") [option] [--model <url>]"
   echo ""
   echo "  (aucune option)    Menu interactif (SSH / IA / start / stop)"
-  echo "  --start            Démarre le serveur sans réinstaller"
+  echo "  --start            Démarre le serveur en foreground (Ctrl+C pour arrêter)"
+  echo "  --daemon, -d       Démarre le serveur en arrière-plan (survit à la déco SSH)"
   echo "  --stop             Arrête le serveur en cours"
   echo "  --ssh              Active l'accès SSH (port 8022, auth par mot de passe)"
   echo "  --model <url>      Utilise un autre modèle GGUF (ex: depuis HuggingFace)"
@@ -462,11 +463,30 @@ launch_server() {
   # Empêcher Android de suspendre le CPU pendant l'inférence
   if command -v termux-wake-lock &>/dev/null; then
     termux-wake-lock
-    trap 'termux-wake-unlock 2>/dev/null || true' EXIT
+    # En mode daemon, le wake-lock doit persister (libéré par --stop)
+    [ "$DAEMON" = "0" ] && trap 'termux-wake-unlock 2>/dev/null || true' EXIT
   fi
 
-  log "Démarrage du serveur (Ctrl+C pour arrêter)..."
-  "$LLAMA_BIN" "${LAUNCH_ARGS[@]}"
+  if [ "$DAEMON" = "1" ]; then
+    log "Démarrage du serveur en arrière-plan..."
+    nohup "$LLAMA_BIN" "${LAUNCH_ARGS[@]}" >> "$LOG_FILE" 2>&1 &
+    SERVER_PID=$!
+    disown "$SERVER_PID" 2>/dev/null || true
+
+    sleep 2
+    if kill -0 "$SERVER_PID" 2>/dev/null; then
+      success "Serveur lancé en arrière-plan (PID: $SERVER_PID)"
+      echo ""
+      echo -e "  ${BOLD}Suivre les logs :${RESET} ${CYAN}tail -f ${LOG_FILE}${RESET}"
+      echo -e "  ${BOLD}Arrêter        :${RESET} ${CYAN}bash $(basename "$0") --stop${RESET}"
+      echo ""
+    else
+      error "Le serveur s'est arrêté immédiatement — consulte ${LOG_FILE}"
+    fi
+  else
+    log "Démarrage du serveur (Ctrl+C pour arrêter)..."
+    "$LLAMA_BIN" "${LAUNCH_ARGS[@]}"
+  fi
 }
 
 # ============================================================
@@ -488,6 +508,7 @@ stop_server() {
 # ============================================================
 SCRIPT_PATH="$(realpath "$0")"
 MODE="install"
+DAEMON=0
 
 # Tout ce qui suit est écrit à la fois à l'écran ET dans $INSTALL_LOG
 mkdir -p "$(dirname "$INSTALL_LOG")"
@@ -496,6 +517,7 @@ exec > >(tee -a "$INSTALL_LOG") 2>&1
 while [ $# -gt 0 ]; do
   case "$1" in
     --start)        MODE="start"; shift ;;
+    --daemon|-d)    MODE="start"; DAEMON=1; shift ;;
     --stop)         MODE="stop";  shift ;;
     --ssh)          MODE="ssh";   shift ;;
     --help|-h)      MODE="help";  shift ;;

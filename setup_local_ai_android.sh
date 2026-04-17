@@ -175,12 +175,22 @@ install_packages() {
   pkg install -y git cmake clang wget curl make libandroid-spawn
 
   if [ "$VULKAN_AVAILABLE" = true ]; then
-    log "Installation des paquets Vulkan (headers, loader, shaderc, spirv)..."
+    log "Installation des paquets Vulkan (headers, loader Android, shaderc, spirv)..."
+    # vulkan-loader-android : charge les drivers Android (ex: /vendor/lib64/hw/vulkan.adreno.so)
+    # vulkan-loader-generic ne fonctionne PAS sur Android (utilise ICD-JSON absent sur Android)
+    # Retirer generic s'il est déjà installé (conflit sur libvulkan.so)
+    if pkg list-installed 2>/dev/null | grep -q "^vulkan-loader-generic/"; then
+      log "Remplacement de vulkan-loader-generic par vulkan-loader-android..."
+      pkg uninstall -y vulkan-loader-generic 2>/dev/null || true
+    fi
     # vulkan-headers + loader = build ; shaderc = glslc ; spirv-headers = spirv.hpp
-    if ! pkg install -y vulkan-headers vulkan-loader-generic shaderc spirv-headers spirv-tools vulkan-tools 2>/dev/null; then
-      warn "Paquets Vulkan dev indisponibles — fallback CPU direct"
-      VULKAN_AVAILABLE=false
-      NGL=0
+    if ! pkg install -y vulkan-headers vulkan-loader-android shaderc spirv-headers spirv-tools vulkan-tools 2>/dev/null; then
+      warn "vulkan-loader-android indisponible — fallback sur generic (Vulkan ne fonctionnera probablement pas à l'exécution)"
+      if ! pkg install -y vulkan-headers vulkan-loader-generic shaderc spirv-headers spirv-tools vulkan-tools 2>/dev/null; then
+        warn "Paquets Vulkan dev indisponibles — fallback CPU direct"
+        VULKAN_AVAILABLE=false
+        NGL=0
+      fi
     fi
   fi
 
@@ -607,6 +617,98 @@ install_ai() {
   echo ""
 }
 
+status_server() {
+  step "Statut & diagnostic"
+
+  # Serveur en cours ?
+  if pgrep -x llama-server > /dev/null; then
+    SERVER_PID=$(pgrep -x llama-server | head -1)
+    success "llama-server en cours (PID: $SERVER_PID)"
+  else
+    warn "llama-server n'est pas lancé"
+  fi
+
+  # IP + endpoint
+  WIFI_IP=$(ip addr show wlan0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1)
+  [ -z "$WIFI_IP" ] && WIFI_IP=$(ip route get 1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++){if($i=="src"){print $(i+1); exit}}}')
+  [ -z "$WIFI_IP" ] && WIFI_IP="<ip-introuvable>"
+  echo -e "  ${BOLD}IP${RESET}          : $WIFI_IP"
+  echo -e "  ${BOLD}Endpoint${RESET}    : http://$WIFI_IP:$PORT"
+
+  # Clé API
+  if [ -f "$API_KEY_FILE" ]; then
+    echo -e "  ${BOLD}Clé API${RESET}     : $(cat "$API_KEY_FILE")"
+  fi
+
+  # Health endpoint
+  if command -v curl &>/dev/null; then
+    HEALTH=$(curl -sf --max-time 2 "http://localhost:$PORT/health" 2>/dev/null || echo "")
+    if [ -n "$HEALTH" ]; then
+      success "/health répond : $HEALTH"
+    else
+      warn "/health ne répond pas (serveur non démarré ou qui charge encore le modèle)"
+    fi
+  fi
+
+  # Vulkan
+  echo ""
+  echo -e "${BOLD}Vulkan :${RESET}"
+  if command -v vulkaninfo &>/dev/null; then
+    VK_DEV=$(vulkaninfo --summary 2>/dev/null | grep -E "deviceName" | head -1)
+    if [ -n "$VK_DEV" ]; then
+      echo "  $VK_DEV"
+    else
+      warn "  Aucun GPU détecté par vulkaninfo"
+      # Détecter le loader actif
+      if pkg list-installed 2>/dev/null | grep -q "^vulkan-loader-generic/"; then
+        warn "  vulkan-loader-generic installé → ne marche pas sur Android"
+        warn "  Relance l'installation IA (option 2) pour basculer sur vulkan-loader-android"
+      fi
+    fi
+  else
+    warn "  vulkaninfo absent"
+  fi
+
+  # Logs llama-server
+  if [ -f "$LOG_FILE" ]; then
+    echo ""
+    echo -e "${BOLD}Logs Vulkan/backend (dans $LOG_FILE) :${RESET}"
+    grep -iE "vulkan|offloaded|backend|device" "$LOG_FILE" 2>/dev/null | tail -10 | sed 's/^/  /'
+
+    echo ""
+    echo -e "${BOLD}20 dernières lignes du log :${RESET}"
+    tail -20 "$LOG_FILE" | sed 's/^/  /'
+  else
+    warn "  Aucun log serveur : $LOG_FILE"
+  fi
+}
+
+change_model_menu() {
+  step "Changer de modèle"
+  echo ""
+  echo "  1) Gemma 4 E2B Q4_K_M (3.1 Go) — actuel par défaut"
+  echo "  2) Gemma 4 E2B Q4_0   (3.0 Go) — plus rapide sur ARM"
+  echo "  3) Gemma 2 2B  Q4_K_M (1.6 Go) — plus léger, plus rapide"
+  echo "  4) Llama 3.2 3B Q4_K_M (2.0 Go)"
+  echo "  5) URL personnalisée"
+  echo "  0) Retour"
+  echo ""
+  read -p "Choix : " MC
+  case "$MC" in
+    1) MODEL_URL="https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf" ;;
+    2) MODEL_URL="https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_0.gguf" ;;
+    3) MODEL_URL="https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf" ;;
+    4) MODEL_URL="https://huggingface.co/bartowski/Llama-3.2-3B-Instruct-GGUF/resolve/main/Llama-3.2-3B-Instruct-Q4_K_M.gguf" ;;
+    5) read -p "URL .gguf : " MODEL_URL ;;
+    0|"") return ;;
+    *) warn "Choix invalide"; return ;;
+  esac
+  MODEL_FILE="$(basename "$MODEL_URL" | cut -d'?' -f1)"
+  check_termux
+  download_model
+  warn "Modèle téléchargé. Redémarre le serveur (option 4) pour l'utiliser."
+}
+
 main_menu() {
   while true; do
     echo ""
@@ -615,28 +717,38 @@ main_menu() {
     echo -e "${BOLD}${GREEN}╚══════════════════════════════════════════════╝${RESET}"
     echo ""
     echo "  1) Installer SSH (accès distant depuis PC)"
-    echo "  2) Installer l'IA (llama.cpp + modèle)"
+    echo "  2) Installer / mettre à jour l'IA (llama.cpp + modèle)"
     echo "  3) Tout installer (SSH puis IA)"
-    echo "  4) Démarrer le serveur"
-    echo "  5) Arrêter le serveur"
-    echo "  6) Quitter"
+    echo "  4) Démarrer le serveur en arrière-plan (recommandé)"
+    echo "  5) Démarrer le serveur en foreground (debug, Ctrl+C pour quitter)"
+    echo "  6) Arrêter le serveur"
+    echo "  7) Statut & diagnostic (IP, Vulkan, logs)"
+    echo "  8) Changer de modèle"
+    echo "  9) Quitter"
     echo ""
-    read -p "Ton choix [1-6] : " CHOICE
+    read -p "Ton choix [1-9] : " CHOICE
     echo ""
     case "$CHOICE" in
       1) install_ssh_with_banner ;;
       2) install_ai
-         read -p "Lancer le serveur maintenant ? [o/N] " CONFIRM
-         [[ "$CONFIRM" =~ ^[oOyY]$ ]] && { launch_server; return; }
+         read -p "Lancer le serveur maintenant en arrière-plan ? [o/N] " CONFIRM
+         if [[ "$CONFIRM" =~ ^[oOyY]$ ]]; then
+           DAEMON=1; launch_server; return
+         fi
          ;;
       3) install_ssh_with_banner
          install_ai
-         read -p "Lancer le serveur maintenant ? [o/N] " CONFIRM
-         [[ "$CONFIRM" =~ ^[oOyY]$ ]] && { launch_server; return; }
+         read -p "Lancer le serveur maintenant en arrière-plan ? [o/N] " CONFIRM
+         if [[ "$CONFIRM" =~ ^[oOyY]$ ]]; then
+           DAEMON=1; launch_server; return
+         fi
          ;;
-      4) check_termux; launch_server; return ;;
-      5) stop_server ;;
-      6) echo "Au revoir !"; return ;;
+      4) check_termux; DAEMON=1; launch_server ;;
+      5) check_termux; DAEMON=0; launch_server; return ;;
+      6) stop_server ;;
+      7) status_server ;;
+      8) change_model_menu ;;
+      9) echo "Au revoir !"; return ;;
       *) warn "Choix invalide : $CHOICE" ;;
     esac
   done

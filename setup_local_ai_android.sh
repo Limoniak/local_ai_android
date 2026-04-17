@@ -13,8 +13,8 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
 
 # --- Config (overridable via variables d'env) ---
 INSTALL_DIR="$HOME/gemma4"
-MODEL_FILE="${MODEL_FILE:-gemma-4-e2b-it-Q4_K_M.gguf}"
-MODEL_URL="${MODEL_URL:-https://huggingface.co/bartowski/gemma-4-e2b-it-GGUF/resolve/main/${MODEL_FILE}}"
+MODEL_FILE="${MODEL_FILE:-gemma-4-E2B-it-Q4_K_M.gguf}"
+MODEL_URL="${MODEL_URL:-https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/${MODEL_FILE}}"
 BOOT_SCRIPT="$HOME/.termux/boot/start-gemma.sh"
 LOG_FILE="$HOME/gemma4-server.log"
 INSTALL_LOG="$HOME/gemma4-install.log"
@@ -170,8 +170,8 @@ install_packages() {
   log "Mise à jour des paquets..."
   pkg update -y && pkg upgrade -y
 
-  log "Installation de : git cmake clang wget curl make..."
-  pkg install -y git cmake clang wget curl make
+  log "Installation de : git cmake clang wget curl make libandroid-spawn..."
+  pkg install -y git cmake clang wget curl make libandroid-spawn
 
   if [ "$VULKAN_AVAILABLE" = true ]; then
     log "Installation des paquets Vulkan (headers, loader, shaderc, spirv)..."
@@ -220,7 +220,12 @@ build_llamacpp() {
     cd build
 
     log "Configuration CMake..."
-    CMAKE_FLAGS=(-DGGML_OPENMP=ON -DCMAKE_BUILD_TYPE=Release)
+    CMAKE_FLAGS=(
+      -DGGML_OPENMP=ON
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_EXE_LINKER_FLAGS=-landroid-spawn
+      -DCMAKE_SHARED_LINKER_FLAGS=-landroid-spawn
+    )
     CURRENT_NGL=$NGL
 
     if [ "$VULKAN_AVAILABLE" = true ]; then
@@ -228,13 +233,20 @@ build_llamacpp() {
       CMAKE_FLAGS+=(-DGGML_VULKAN=ON)
     fi
 
+    CMAKE_CPU_FALLBACK_FLAGS=(
+      -DGGML_OPENMP=ON
+      -DCMAKE_BUILD_TYPE=Release
+      -DCMAKE_EXE_LINKER_FLAGS=-landroid-spawn
+      -DCMAKE_SHARED_LINKER_FLAGS=-landroid-spawn
+    )
+
     if ! cmake .. "${CMAKE_FLAGS[@]}"; then
       if [ "$CURRENT_NGL" != "0" ]; then
         warn "Échec cmake avec Vulkan — fallback CPU..."
         CURRENT_NGL=0
         # Nettoyer le cache CMake pour ne pas re-tenter Vulkan
         rm -rf ./* ./.??* 2>/dev/null || true
-        cmake .. -DGGML_OPENMP=ON -DCMAKE_BUILD_TYPE=Release
+        cmake .. "${CMAKE_CPU_FALLBACK_FLAGS[@]}"
       else
         error "Échec de la configuration CMake"
       fi
@@ -249,7 +261,7 @@ build_llamacpp() {
         warn "Échec make avec Vulkan — fallback CPU (recompilation complète)..."
         CURRENT_NGL=0
         rm -rf ./* ./.??* 2>/dev/null || true
-        cmake .. -DGGML_OPENMP=ON -DCMAKE_BUILD_TYPE=Release
+        cmake .. "${CMAKE_CPU_FALLBACK_FLAGS[@]}"
         make -j"$JOBS" llama-server
       else
         error "Échec de la compilation"
